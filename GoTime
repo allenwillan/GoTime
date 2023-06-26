@@ -1,0 +1,638 @@
+#!/usr/bin/env python3
+
+import re
+import os
+import os.path
+import subprocess
+import argparse
+import signal
+import glob
+import requests
+import json
+import time
+import datetime
+
+from colorama import Fore, Back, Style
+from colorama import init
+
+from urllib.parse import urlparse
+from pathlib import Path
+from bs4 import BeautifulSoup
+
+def update_targetsh(ip, host, logdir, tunip):
+    #Output our target.sh file for use by the Panel doodad (sold separately)
+    targetsh = os.path.join(logdir, 'target.sh')
+    print(f'[+] Updating {targetsh}')
+    with open(targetsh, 'w') as f:
+        f.write(f'echo "[ {host} - {ip} | Local - {tunip} ]"')
+
+def check_for_vpn():
+    #Check through the process list to see if we can find any openvpn already running
+    print('[+] Checking for running openvpn')
+    ps = subprocess.run(['ps', '-ef'], capture_output=True)
+    found = []
+    for i in ps.stdout.split(b'\n'):
+        if re.search(b'openvpn', i):
+            #Regex to pull out the specific PID and CLI
+            r = re.search(b'\\s+ +(\\d+) +\\d+.*:\\d+ +(.*)', i)
+            pid, cli = r.groups()
+            found.append([pid.decode(), cli.decode()])
+    return found
+
+def kill_vpns(pidlist):
+    #Check with the user if we want to kill all these extra VPN pids
+    #  After blindly killing one of the parents, some of the children will fail
+    k = input('Kill the above PIDs? (Y/n)')
+    if k.lower() == 'y' or not k:
+        for i in pidlist:
+            subprocess.run(['sudo', 'kill', i])
+
+def start_vpn(vpn, vpndir):
+    #If we ere given a specific file to use, use that
+    if os.path.exists(vpn):
+        vpnfile = vpn
+    #Otherwise, try to look into the vpn directory and find something with the string in it
+    else:
+        vpnfile = glob.glob(os.path.join(vpndir, f'*{vpn}*'))[0]
+
+    print(f'[+] Starting VPN: {vpnfile}')
+    #Kick off openvpn in a new window so that it sticks around and the user has access to it later
+    #  also we need to sudo...
+    print(Fore.BLUE + f'sudo openvpn {vpnfile}')
+    subprocess.run(['exo-open', '--launch', 'TerminalEmulator', 'sudo', 'openvpn', vpnfile], capture_output=False)
+
+def update_kali():
+    #Update our list of updates
+    print(Fore.BLUE + 'sudo apt update')
+    os.system('sudo apt update')
+    #Blindly update everything
+    print(Fore.BLUE + 'sudo apt -y full-upgrade')
+    os.system('sudo apt -y full-upgrade')
+    #Ask apt to cleanup derelict data
+    print(Fore.BLUE + 'sudo apt autoremove')
+    os.system('sudo apt autoremove')
+
+def whatsmyip():
+    #We use wtfismyip.com because they purport to not track information, and they return in JSON
+    # Please excuse the language...
+    ret = requests.get(r'https://wtfismyip.com/json')
+    j = json.loads(ret.content.decode())
+    print('[+] Your external IP information: ')
+    #Just blindly print the returned information, skipping the vulgar part for the output
+    for key in j:
+        title = key[11:]
+        print('        {:15} : {}'.format(title, j[key]))
+
+def get_tunip():
+    #Run ifconfig for the tun0 interface and grab the IP address. Keep cycling until Tun0 shows up
+    while(True):
+        ps = subprocess.run(['ifconfig', 'tun0'], capture_output=True)
+        for i in ps.stdout.split(b'\n'):
+            if re.search(b'netmask', i):
+                #This regex is lazy but good enough
+                r = re.search(b'inet +([0-9\\.]+) +', i)
+                tunip = r.groups()[0].decode()
+                print(f'[+] Your tunnel interface IP: {tunip}')
+                return tunip
+
+def ping_target(ip):
+    print(f'[+] Attempting to ping {ip}')
+    #Try to ping the target up to 10 times
+    for c in range(0,10):
+        #Run a single ping
+        p = subprocess.run(['ping', '-c1', ip], capture_output=True)
+        #Check the output, and see if it's successful
+        for i in p.stdout.split(b'\n'):
+            if re.search(b'bytes from', i):
+                secs = c*5
+                print(f'[+] Success after {secs}s: ')
+                print('        ', i.decode().strip())
+                return True
+        #Otherwise, sleep 5 seconds and try again
+        if not c == 9:
+            time.sleep(5)
+    print('[-] Failure after 50s')
+    return False
+
+def nmap_target(ip, logdir):
+    print(Fore.BLUE + f'[+] Running nmap: ')
+    #Nice and easy, just nmap the target and output into our log directory
+    nmap_args = [
+                    'nmap',
+                    '-sV',      #  -sV: Probe open ports to determine service/version info
+                    '-sC',      #  -sC: equivalent to --script=default
+                    '-p-',      #  -p <port ranges>: Only scan specified ports
+                                #       -p- should scan all ports
+                    #  -oN/-oX/-oS/-oG <file>: Output scan in normal, XML, s|<rIpt kIddi3,
+                    #     and Grepable format, respectively, to the given filename.
+                    '-oN', os.path.join(logdir, 'nmap.normal'),
+                    '-oX', os.path.join(logdir, 'nmap.xml'),
+                    '-oG', os.path.join(logdir, 'nmap.grep'),
+                    '-v',       #  -v: Increase verbosity level (use -vv or more for greater effect)
+                    ip
+                ]
+    print(Fore.BLUE + ' '.join(nmap_args))
+    topbanner('Nmap')
+    os.system(' '.join(nmap_args))
+    botbanner('Nmap')
+    
+
+def run_nikto(targetip, tport, logdir):
+    print(Fore.BLUE + f'[+]    Running Nikto against {targetip}:{tport}')
+    #Make directory for our output and choose an output file for the screen logging
+    niktodir = os.path.join(logdir, f'{targetip}-{tport}_nikto_responses')
+    niktotxt = os.path.join(logdir, f'{targetip}-{tport}_nikto.txt')
+    os.makedirs(niktodir, mode=0o770, exist_ok=True)
+    nikto_args = [
+                    'nikto',
+                    '-host', targetip,  #       -host+             Target host/URL
+                    '-port', tport,     #       -port+             Port to use (default 80)
+                    '-Save', niktodir,  #       -Save              Save positive responses to this directory ('.' for auto-name)
+                    '-output', niktotxt #       -output+           Write output to this file ('.' for auto-name)
+                 ]
+    print(Fore.BLUE + ' '.join(nikto_args))
+    topbanner('Nikto')
+    os.system(' '.join(nikto_args))
+    botbanner('Nikto')
+
+def run_skipfish(targetip, tport, turl, logdir, tproto):
+    goturl = True
+    #If we didn't get a URL, just make one with the IP instead
+    if not turl:
+        goturl = False
+        turl = f'{tproto}://{targetip}:{tport}'
+    print(Fore.BLUE + f'[+]    Running Skipfish against {targetip}:{tport} as {turl}')
+    #Parse the URL so that we can pull out the hostname
+    parse_uri = urlparse(turl)
+    thost = parse_uri.netloc
+    ttime = datetime.datetime.now().timestamp()
+    #Make a directory for our output with the IP, port, and a unique time
+    skipfishdir = os.path.join(logdir, f'{targetip}-{tport}_skipfish_responses_{ttime}')
+    os.makedirs(skipfishdir, mode=0o770, exist_ok=True)
+
+    #Usage: skipfish [ options ... ] -W wordlist -o output_dir start_url [ start_url2 ... ]
+    skipfish_args = [
+                    'skipfish',
+                    '-o', skipfishdir              #  -o dir          - write output to specified directory (required)
+                 ]
+    if goturl:
+        skipfish_args.extend([
+                                '-F', f'{thost}={targetip}',    #  -F host=IP        - pretend that 'host' resolves to 'IP'
+                            ])
+    skipfish_args.append(turl)
+    print(Fore.BLUE + ' '.join(skipfish_args))
+    
+    topbanner('Skipfish')
+    #Because Skipfish overwrites the terminal, we use exo-open to kick off a new terminal window
+    #  to host the Skipfish run. This Window dies after the Skipfish is finished. Additionally,
+    #  there doesn't seem to be a way to skip the 60 second wait at the beginning, so GoTime is
+    #  60s*numhttp slower because of Skipfish's bad design... thanks
+    subprocess.run(['exo-open', '--launch', 'TerminalEmulator', ' '.join(skipfish_args)], capture_output=False)
+    botbanner('Skipfish')
+
+    print('       !!! Waiting for Skipfish to finish in another window\n\n')
+    #Cycle and sleep until Skipfish isn't in the process list for whatever reason (death or finishing)
+    running = True
+    while(running):
+        ps = subprocess.run(['ps', '-ef'], capture_output=True)
+        running = False
+        for i in ps.stdout.split(b'\n'):
+            if re.search(b'skipfish', i):
+                running = True
+        time.sleep(5)
+
+def run_bbot(targetip, tport, turl, logdir, tproto):
+    print(Fore.BLUE + f'[+]    Running BBOT against {targetip}:{tport} and {turl}')
+    scanname = f'{targetip}-{tport}'
+    bbot_args = [
+                    os.path.expanduser(os.path.join('~','.local','bin','bbot')),
+                    '-y',
+                    '-n', scanname,             #  -n SCAN_NAME, --name SCAN_NAME
+                                                #                        Name of scan (default: random)
+                    '-om',                      #   -om MODULE [MODULE ...], --output-modules MODULE [MODULE ...]
+                        'asset_inventory',      ## Output to an asset inventory style flattened CSV file
+                        'csv',                  ## Output to CSV
+                        'human',                ## Output to text
+                        'json',                 ## Output to JSON
+                        'neo4j',                ## Output to Neo4j
+                        'web_report',           ## Create a markdown report with web assets
+                    '-f',                       #  -f FLAG [FLAG ...], --flags FLAG [FLAG ...]
+                                                #                        Enable modules by flag.
+                        'active',               
+                        'aggressive',           
+                        'subdomain-enum',       
+                    '-m',                       #  -m MODULE [MODULE ...], --modules MODULE [MODULE ...]
+                                                #                        Modules to enable.
+                        #'nuclei',               ## Fast and customisable vulnerability scanner
+                        #Nuclei needs sudo every time, which is annoying
+                        'gowitness',            ## Take screenshots of webpages
+                        'wappalyzer',           ## Extract technologies from web responses
+                    '-ef',                      #  -ef FLAG [FLAG ...], --exclude-flags FLAG [FLAG ...]
+                                                #                        Disable modules with these flags. (e.g. -ef aggressive)
+                        'passive',              ## Mostly DNS lookups against public resources, useless in HTB environment
+                        'social',               ## Enumerates social media links, useless in HTB environment
+                    '--allow-deadly',           #  --allow-deadly        Enable the use of highly aggressive modules
+                    '-c',                       #  -c [CONFIG ...], --config [CONFIG ...]
+                                                #                        custom config file, or configuration options in key=value format: 'modules.shodan.api_key=1234'
+                        'web_spider_distance=10',  ## Set the maximum number of HTTP links that can be followed in a row
+                        'web_spider_depth=10',     ## Set the maximum directory depth for the web spider
+                    '-o', os.path.join(logdir, 'bbot'), #  -o DIR, --output-dir DIR
+                    '--force',                  #  --force               Run scan even if module setups fail
+                    '-t',                       #  -t TARGET [TARGET ...], --targets TARGET [TARGET ...]
+                                                #                        Targets to seed the scan
+                        f'{targetip}:{tport}', turl
+                ]
+    print(Fore.BLUE + ' '.join(bbot_args))
+    
+    topbanner('BBOT')
+    os.system(' '.join(bbot_args))
+    botbanner('BBOT')
+
+def update_etchosts(host, ip, logdir):
+    print(Fore.BLUE + f'[!]    Updating /etc/hosts to contain "{ip} {host}"')            
+    outlines = []
+    changed = False
+    found = False
+    #Run through the /etc/hosts file and build a new one
+    with open('/etc/hosts', 'r') as f:
+        for line in f.readlines():
+            #If we've found the host we're looking for...
+            if re.search(host, line):
+                found = True
+                #Check to see if it's the right IP, if so, ignore it
+                if re.search(ip, line):
+                    outlines.append(line)
+                #Otherwise, update it with the new IP
+                else:
+                    changed = True
+                    outlines.append(f'{ip} {host}\n')
+            #This is an unrelated line, just add it
+            else:
+                outlines.append(line)
+
+    #If we didn't find the host (correct or otherwise), add it at the end
+    if not found:
+        outlines.append(f'{ip} {host}\n')
+
+    #If we've modified the file, write it out to our log directory as hosts.tmp
+    if changed or not found:
+        with open(os.path.join(logdir, 'hosts.tmp'), 'w') as f:
+            for line in outlines:
+                f.write(line)
+
+        #To actually update the file, we copy the original to hosts.bak in our directory,
+        #  then sudo copy our hosts.tmp over the /etc/hosts
+        update_args = [
+                        'cp', '/etc/hosts', os.path.join(logdir, 'hosts.bak'),
+                        ';',
+                        'sudo', 'cp', os.path.join(logdir, 'hosts.tmp'), '/etc/hosts'
+                      ]
+        print(Fore.BLUE + ' '.join(update_args))
+        os.system(' '.join(update_args))
+    else:
+        print('       No update needed')
+
+
+def target_web(args, nmap_info, logdir):
+    targetip = args.ip
+    skip = args.skip
+    demo = args.demo
+    targethost = args.host
+    print('[+] Checking for http/https ports')
+    target_infos = []
+    #Look through all the scanning information for http-based services
+    for n in nmap_info:
+        if 'service_name' in n and re.search('http', n['service_name'], flags=re.I):
+            print('[+]    Found: {}'.format(n))
+            target_infos.append(n)
+
+    if not target_infos:
+        print('[-]    No web ports found')
+        return
+
+    if demo:
+        input(Fore.YELLOW + 'pausing...' + Style.RESET_ALL)
+
+    #For each port, just assume/hope that it actually works and blindly scan it
+    #  This can be weird for some Windows systems since some of the Windows services
+    #  run as http/https
+    for n in target_infos:
+        tport = n['portid']
+        tproto = 'http'
+        #Check if we see ssl and change the protocol to match
+        if 'service_tunnel' in n and n['service_tunnel'] == 'ssl':
+            tproto = 'https'
+        turl = ''
+
+        #Try to grab the redirect_url field and record it for our URLs
+        if 'redirect_url' in n:
+            turl = n['redirect_url']
+            parse_uri = urlparse(turl)
+            thost = parse_uri.netloc
+            #And also update /etc/hosts for convience and redirects
+            update_etchosts(thost, targetip, logdir)
+        else:
+            turl = f'{tproto}://{targethost}.htb:{tport}'.lower()
+
+        #Run nikto if not skipped
+        if not 'nikto' in skip:
+            if check_install('nikto'):
+                run_nikto(targetip, tport, logdir)
+            else:
+                print(Fore.YELLOW + '[-] Not installed: nikto')
+
+        #Run Skipfish if not skipped
+        if not 'skipfish' in skip:
+            if check_install('skipfish'):
+                run_skipfish(targetip, tport, turl, logdir, tproto)
+            else:
+                print(Fore.YELLOW + '[-] Not installed: skipfish')
+
+        #Run BBOT if not skipped
+        if not 'bbot' in skip:
+            if check_install('bbot'):
+                run_bbot(targetip, tport, turl, logdir, tproto)
+            else:
+                print(Fore.YELLOW + '[-] Not installed: bbot')
+
+def run_ldapsearch(targetip, tport, logdir, tproto):
+    #usage: ldapsearch [options] [filter [attributes...]]
+    #where:
+    #  filter        RFC 4515 compliant LDAP search filter
+    #  attributes    whitespace-separated list of attribute descriptions
+    #    which may include:
+    #      1.1   no attributes
+    #      *     all user attributes
+    #      +     all operational attributes
+    print(Fore.BLUE + f'[+]    Running ldapsearch against {tproto}://{targetip}:{tport}')
+    ldap_args = [
+                    'ldapsearch',
+                    '-H', f'{tproto}://{targetip}:{tport}',     #  -H URI     LDAP Uniform Resource Identifier(s)
+                    '-x',                                       #  -x         Simple authentication
+                    '-s', 'base',                               #  -s scope   one of base, one, sub or children (search scope)
+                    '-b', "''",                                 #  -b basedn  base dn for search
+                    '"(objectClass=*)"', '"*"', '+'
+                ]
+    print(Fore.BLUE + ' '.join(ldap_args))
+    
+    topbanner('ldapsearch')
+    os.system(' '.join(ldap_args))
+    botbanner('ldapsearch')
+
+def target_ldap(args, nmap_info, logdir):
+    targetip = args.ip
+    skip = args.skip
+    demo = args.demo
+    print('[+] Checking for ldap/ldaps ports')
+    target_infos = []
+    for n in nmap_info:
+        if 'service_name' in n and re.search('ldap', n['service_name'], flags=re.I):
+            print('[+]    Found: {}'.format(n))
+            target_infos.append(n)
+
+    if not target_infos:
+        print('[-]    No ldap ports found')
+        return
+
+    if demo:
+        input(Fore.YELLOW + 'pausing...' + Style.RESET_ALL)
+
+    for n in target_infos:
+        tport = n['portid']
+        tproto = 'ldap'
+        if not 'ldapsearch' in skip:
+            if check_install('ldapsearch'):
+                run_ldapsearch(targetip, tport, logdir, tproto)
+            else:
+                print(Fore.YELLOW + '[-] Not installed: ldapsearch')
+        
+def topbanner(instr):
+    print(Fore.GREEN + '\n' + '='*60)
+    print(Fore.GREEN + '=== {:20} ==================================='.format(instr))
+    print(Fore.GREEN + 'V'*60 + '\n')
+
+def botbanner(instr):
+    print(Fore.GREEN + '\n' + '^'*60 + '\n')
+
+def get_nmap_info(targetip, logdir):
+    #Use BeautifulSoup to parse the nmap.xml for us
+    nmapxml = os.path.join(logdir, 'nmap.xml')
+    with open(nmapxml, 'r') as f:
+        soup = BeautifulSoup(f, features='lxml-xml')
+
+    portinfo = []
+    #Find all the port data
+    for p in soup.find_all('port'):
+        thisport = {}
+        #Get the basic port information
+        for key in p.attrs:
+            thisport[key] = p.attrs[key]
+        #Get the state information
+        for eles in p.find_all('state'):
+            for key in eles.attrs:
+                thisport['state_'+key] = eles.attrs[key]
+        #Get the service information
+        for eles in p.find_all('service'):
+            for key in eles.attrs:
+                thisport['service_'+key] = eles.attrs[key]
+        #Try to shove all the script information in, hopefully in a helpful way
+        for eles in p.find_all('script'):
+            attr = eles.attrs
+            thisport[attr['id']] = attr['output']
+            for sub in eles.findChildren():
+                if 'key' in sub.attrs:
+                    if sub.text:
+                        thisport[sub.attrs['key']] = sub.text
+        #Add our dictionary of information about our port into the port listing
+        portinfo.append(thisport)
+
+    #Return our data so it can be used by scanners
+    return portinfo
+
+def start_wireshark():
+    print('[+] Checking for running Wireshark')
+    #Check if Wireshark is running. If it is, check with the user to either run a new one or not
+    ps = subprocess.run(['ps', '-ef'], capture_output=True)
+    found = []
+    for i in ps.stdout.split(b'\n'):
+        if re.search(b'wireshark', i):
+            while(True):
+                o = input('Wireshark is already running! Do you want to start a new Wireshark! [y/n]')
+                if o.lower() == 'y':
+                    break
+                elif o.lower() == 'n':
+                    return
+            break
+
+    wireshark_args = [
+                    'wireshark',
+                    '--interface', 'tun0',      #  -i <interface>, --interface <interface>
+                                                #       name or idx of interface (def: first non-loopback)
+                    '--no-promiscuous-mode',    #  -p, --no-promiscuous-mode
+                                                #       don't capture in promiscuous mode
+                    '-k',                       #  -k                       start capturing immediately (def: do nothing)
+                    '-S',                       #  -S                       update packet display when new packets are captured
+                    '-l',                       #  -l                       turn on automatic scrolling while -S is in use
+                    '-n'                        #  -n                       disable all name resolutions (def: all enabled)
+                 ]
+    print(Fore.BLUE + ' '.join(wireshark_args))
+    subprocess.Popen(wireshark_args, 
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, #Silence all the garbage output
+                preexec_fn=os.setpgrp           # Causes the process to be spawned in its own process group so that it can live
+                                                #  beyond the end of GoTime
+                    )
+    time.sleep(5)   #Sleep for a few seconds to give Wireshark time to start up before we start scanning
+
+def check_install(tool):
+    #Check to see if we can which the tool name, hopefully telling us it's installed
+    wh = subprocess.run(['which', tool], capture_output=True)
+    found = []
+    for i in wh.stdout.split(b'\n'):
+        #Although "tool not found" is displayed on the CLI, the only captured output
+        #  is a successful run of which, so we just need to check for the tool name
+        if re.search(tool.encode('utf8'), i):
+            return True
+    if tool == 'bbot':
+        if os.path.exists(os.path.expanduser(os.path.join('~','.local','bin','bbot'))):
+            return True
+    return False
+
+def main():
+    parser = argparse.ArgumentParser(    prog='GoTime',
+                                        description='Script to set up Kali for Hack The Box exercises')
+    parser.add_argument('-i', '--ip', action='store', metavar='IPADDR', required=True, 
+                            help='IP address of the target host')
+    parser.add_argument('-n', '--host', action='store', metavar='HOST', required=True,
+                            help='Host name (used for directory and target sting)')
+    parser.add_argument('--logdir', action='store', default=Path.home(),
+                            help='Base directory to create the host directory and the target.sh')
+    parser.add_argument('--vpn', action='store', default='lab',
+                            help='The VPN to attempt to use (either full path or partial name)')
+    parser.add_argument('--vpndir', action='store', default=os.path.join(Path.home(), 'vpn'),
+                            help='Path to look for VPN configs in')
+    parser.add_argument('--update', action='store_true',
+                            help='Run sudo get update, sudo apt -y full-upgrade, and sudo apt autoremove')
+
+    parser.add_argument('--connected', action='store_true',
+                            help='Already connected, so skip the VPN checks')
+    parser.add_argument('--nmapped', action='store_true',
+                            help='Already nmapped, so skip the nmap scan and use prevous results')
+    parser.add_argument('--nowireshark', action='store_true',
+                            help='Do not start Wireshark (default is to start)')
+    parser.add_argument('--demo', action='store_true',
+                            help='Require user to provide input between steps')
+    parser.add_argument('--skip', action='store', nargs='+', default = [],
+                            help='List of scan types to skip. Options: [web, nikto, skipfish, bbot, ldap, ldapsearch]')
+
+    args = parser.parse_args()
+
+    #Ask colorama to automatically reset the color have a print so we don't have to Style.RESET_ALL every time
+    #  although it doesn't seem to do this on input(), so we still need to manually do it there
+    init(autoreset=True)
+
+    #If we've been asked to update, go run apt commands to update Kali
+    if args.update:
+        print(Fore.GREEN + '\n\n' + '='*60)
+        print(Fore.GREEN + 'Updating Kali...')
+        print(Fore.GREEN + '='*60)
+        update_kali()
+
+    print(Fore.GREEN + '\n\n' + '='*60)
+    print(Fore.GREEN + f'Prepping for {args.ip} {args.host}')
+    print(Fore.GREEN + '='*60)
+
+    #Make sure the directory stucture that the user asked for exists
+    os.makedirs(args.logdir, mode=0o770, exist_ok=True)
+
+    #If we're showing the script off, pause
+    if args.demo:
+        input(Fore.YELLOW + 'pausing...' + Style.RESET_ALL)
+
+    #If the user doesn't say their connected, to some connecting
+    if not args.connected:
+        #Check and display the external IP address
+        whatsmyip()
+
+        if args.demo:
+            input(Fore.YELLOW + 'pausing...' + Style.RESET_ALL)
+    
+        #Get the list of running VPN commands
+        running_vpn = check_for_vpn()
+        found_good_vpn = False
+        bad_pid = []
+        #Look through the running commands to see if we have matches or mismatches
+        for v in running_vpn:
+            if re.search(args.vpn, v[1]):
+                if not found_good_vpn:
+                    print('[+] Found matching VPN:')
+                print(f'        PID:{v[0]} CLI:{v[1]}')
+                found_good_vpn = True
+            else:
+                print(f'[-] Found different VPN: PID:{v[0]} CLI:{v[1]}')
+                bad_pid.append(v[0])
+
+        #If there are mismatched VPNs, ask if we want to kill those pids
+        if bad_pid:
+            kill_vpns(bad_pid)
+
+        #If we couldn't find a good VPN, start one
+        if not found_good_vpn:
+            start_vpn(args.vpn, args.vpndir)
+
+    #Check our ifconfig and see what our tunnel interfaces' IP is
+    tunip = get_tunip()
+
+    #Update our target.sh file for our panel doodad, if anyone cares
+    update_targetsh(args.ip, args.host, args.logdir, tunip)
+
+    if args.demo:
+        input(Fore.YELLOW + 'pausing...' + Style.RESET_ALL)
+
+    #Check for or create a directory for the host to store our logs in
+    hostdir = os.path.join(args.logdir, args.host)
+    if os.path.exists(hostdir):
+        print(f'[+] Host directory exists: {hostdir}')
+    else:
+        os.makedirs(hostdir, mode=0o770, exist_ok=True)
+        print(f'[+] Host directory created: {hostdir}')
+
+    #Check if the user doesn't want Wireshark, and otherwise start it
+    if not args.nowireshark:
+        start_wireshark()
+
+    if args.demo:
+        input(Fore.YELLOW + 'pausing...' + Style.RESET_ALL)
+
+    print(Fore.GREEN + '\n\n' + '='*60)
+    print(Fore.GREEN + f'Engaging {args.ip} {args.host}')
+    print(Fore.GREEN + '='*60)
+
+    #Just assume that there is probably a DNS entry needed for target.htb
+    update_etchosts(f'{args.host}.htb'.lower(), args.ip, hostdir)
+
+    #Ping the target until we see that it's up
+    pinged = ping_target(args.ip)
+
+    #If the user says the've already nmapped, skip it, otherwise scan away
+    if not args.nmapped:
+        nmap_target(args.ip, hostdir)
+
+    #Parse the previously/recently generated nmap data to inform other scanning
+    nmap_info = get_nmap_info(args.ip, hostdir)
+
+    if args.demo:
+        input(Fore.YELLOW + 'pausing...' + Style.RESET_ALL)
+    
+    #Skip or run our web scanning
+    if not 'web' in args.skip:
+        print(Fore.GREEN + '='*60)
+        target_web(args, nmap_info, hostdir)
+
+    #Skip or run our ldap scanning
+    if not 'ldap' in args.skip:
+        print(Fore.GREEN + '='*60)
+        target_ldap(args, nmap_info, hostdir)
+
+
+if __name__ == '__main__':
+    main()
