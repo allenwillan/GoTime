@@ -12,6 +12,7 @@ I try to weekly work on some of the machines on HackTheBox, to include their new
 3. Other labs - I mainly focus on HTB as my pentesting practice lab, but this could be adjusted to work with other lab environments, particularly be adjusting the way VPNs are handled (or handling the VPN manually.)
 
 Resources
+* https://github.com/allenwillan/GoTime - Github repo
 * YOUTUBE - Video overview
 * https://app.hackthebox.com/ - Virtual lab this was coded against
 * https://academy.hackthebox.com/ - HTB's learning website, which inspired some of the commands and syntax
