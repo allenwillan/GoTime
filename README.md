@@ -13,7 +13,7 @@ I try to weekly work on some of the machines on HackTheBox, to include their new
 
 Resources
 * https://github.com/allenwillan/GoTime - Github repo
-* YOUTUBE - Video overview
+* https://youtu.be/_2LRRC1Thco - Video overview
 * https://app.hackthebox.com/ - Virtual lab this was coded against
 * https://academy.hackthebox.com/ - HTB's learning website, which inspired some of the commands and syntax
 * https://nmap.org/ - Nmap has a lot of great usage information that I used to pick what I felt were ideal flags for this exercise
